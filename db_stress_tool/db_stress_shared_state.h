@@ -11,6 +11,10 @@
 #pragma once
 
 #include "db_stress_tool/db_stress_stat.h"
+// SyncPoint is not supported in Released Windows Mode.
+#if !(defined NDEBUG) || !defined(OS_WIN)
+#include "test_util/sync_point.h"
+#endif  // !(defined NDEBUG) || !defined(OS_WIN)
 #include "util/gflags_compat.h"
 
 DECLARE_uint64(seed);
@@ -22,8 +26,11 @@ DECLARE_int32(nooverwritepercent);
 DECLARE_string(expected_values_path);
 DECLARE_int32(clear_column_family_one_in);
 DECLARE_bool(test_batches_snapshots);
+DECLARE_int32(compaction_thread_pool_adjust_interval);
+DECLARE_int32(continuous_verification_interval);
+DECLARE_int32(read_fault_one_in);
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 class StressTest;
 
 // State shared by all concurrent executions of the same benchmark.
@@ -34,6 +41,20 @@ class SharedState {
   static const uint32_t UNKNOWN_SENTINEL;
   // indicates a key should definitely be deleted
   static const uint32_t DELETION_SENTINEL;
+
+  // Errors when reading filter blocks are ignored, so we use a thread
+  // local variable updated via sync points to keep track of errors injected
+  // while reading filter blocks in order to ignore the Get/MultiGet result
+  // for those calls
+#if defined(ROCKSDB_SUPPORT_THREAD_LOCAL)
+#if defined(OS_SOLARIS)
+  static __thread bool ignore_read_error;
+#else
+  static thread_local bool ignore_read_error;
+#endif // OS_SOLARIS
+#else
+  static bool ignore_read_error;
+#endif // ROCKSDB_SUPPORT_THREAD_LOCAL
 
   SharedState(Env* env, StressTest* stress_test)
       : cv_(&mu_),
@@ -47,17 +68,19 @@ class SharedState {
         num_done_(0),
         start_(false),
         start_verify_(false),
+        num_bg_threads_(0),
         should_stop_bg_thread_(false),
-        bg_thread_finished_(false),
+        bg_thread_finished_(0),
         stress_test_(stress_test),
         verification_failure_(false),
+        should_stop_test_(false),
         no_overwrite_ids_(FLAGS_column_families),
         values_(nullptr),
         printing_verification_results_(false) {
     // Pick random keys in each column family that will not experience
     // overwrite
 
-    printf("Choosing random keys with no overwrite\n");
+    fprintf(stdout, "Choosing random keys with no overwrite\n");
     Random64 rnd(seed_);
     // Start with the identity permutation. Subsequent iterations of
     // for loop below will start with perm of previous for loop
@@ -159,9 +182,31 @@ class SharedState {
         ptr.reset(new port::Mutex);
       }
     }
+    if (FLAGS_compaction_thread_pool_adjust_interval > 0) {
+      ++num_bg_threads_;
+      fprintf(stdout, "Starting compaction_thread_pool_adjust_thread\n");
+    }
+    if (FLAGS_continuous_verification_interval > 0) {
+      ++num_bg_threads_;
+      fprintf(stdout, "Starting continuous_verification_thread\n");
+    }
+#ifndef NDEBUG
+    if (FLAGS_read_fault_one_in) {
+      SyncPoint::GetInstance()->SetCallBack("FaultInjectionIgnoreError",
+                                            IgnoreReadErrorCallback);
+      SyncPoint::GetInstance()->EnableProcessing();
+    }
+#endif // NDEBUG
   }
 
-  ~SharedState() {}
+  ~SharedState() {
+#ifndef NDEBUG
+    if (FLAGS_read_fault_one_in) {
+      SyncPoint::GetInstance()->ClearAllCallBacks();
+      SyncPoint::GetInstance()->DisableProcessing();
+    }
+#endif
+  }
 
   port::Mutex* GetMutex() { return &mu_; }
 
@@ -199,7 +244,11 @@ class SharedState {
 
   void SetVerificationFailure() { verification_failure_.store(true); }
 
-  bool HasVerificationFailedYet() { return verification_failure_.load(); }
+  bool HasVerificationFailedYet() const { return verification_failure_.load(); }
+
+  void SetShouldStopTest() { should_stop_test_.store(true); }
+
+  bool ShouldStopTest() const { return should_stop_test_.load(); }
 
   port::Mutex* GetMutexForKey(int cf, int64_t key) {
     return key_locks_[cf][key >> log2_keys_per_lock_].get();
@@ -290,11 +339,13 @@ class SharedState {
 
   void SetShouldStopBgThread() { should_stop_bg_thread_ = true; }
 
-  bool ShoudStopBgThread() { return should_stop_bg_thread_; }
+  bool ShouldStopBgThread() { return should_stop_bg_thread_; }
 
-  void SetBgThreadFinish() { bg_thread_finished_ = true; }
+  void IncBgThreadsFinished() { ++bg_thread_finished_; }
 
-  bool BgThreadFinished() const { return bg_thread_finished_; }
+  bool BgThreadsFinished() const {
+    return bg_thread_finished_ == num_bg_threads_;
+  }
 
   bool ShouldVerifyAtBeginning() const {
     return expected_mmap_buffer_.get() != nullptr;
@@ -311,6 +362,10 @@ class SharedState {
   }
 
  private:
+  static void IgnoreReadErrorCallback(void*) {
+    ignore_read_error = true;
+  }
+
   port::Mutex mu_;
   port::CondVar cv_;
   const uint32_t seed_;
@@ -323,10 +378,12 @@ class SharedState {
   long num_done_;
   bool start_;
   bool start_verify_;
+  int num_bg_threads_;
   bool should_stop_bg_thread_;
-  bool bg_thread_finished_;
+  int bg_thread_finished_;
   StressTest* stress_test_;
   std::atomic<bool> verification_failure_;
+  std::atomic<bool> should_stop_test_;
 
   // Keys that should not be overwritten
   std::unordered_set<size_t> no_overwrite_ids_;
@@ -366,5 +423,5 @@ struct ThreadState {
   ThreadState(uint32_t index, SharedState* _shared)
       : tid(index), rand(1000 + index + _shared->GetSeed()), shared(_shared) {}
 };
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
 #endif  // GFLAGS

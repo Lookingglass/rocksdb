@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -15,7 +16,7 @@
 #include "rocksdb/filter_policy.h"
 #include "rocksdb/table.h"
 
-namespace rocksdb {
+namespace ROCKSDB_NAMESPACE {
 
 class Slice;
 
@@ -27,6 +28,11 @@ class BuiltinFilterBitsBuilder : public FilterBitsBuilder {
   // metadata. Passing the result to CalculateNumEntry should
   // return >= the num_entry passed in.
   virtual uint32_t CalculateSpace(const int num_entry) = 0;
+
+  // Returns an estimate of the FP rate of the returned filter if
+  // `keys` keys are added and the filter returned by Finish is `bytes`
+  // bytes.
+  virtual double EstimatedFpRate(size_t keys, size_t bytes) = 0;
 };
 
 // RocksDB built-in filter policy for Bloom or Bloom-like filters.
@@ -125,8 +131,12 @@ class BloomFilterPolicy : public FilterPolicy {
   // implementation) for building new SST filters.
   Mode mode_;
 
+  // Whether relevant warnings have been logged already. (Remember so we
+  // only report once per BloomFilterPolicy instance, to keep the noise down.)
+  mutable std::atomic<bool> warned_;
+
   // For newer Bloom filter implementation(s)
   FilterBitsReader* GetBloomBitsReader(const Slice& contents) const;
 };
 
-}  // namespace rocksdb
+}  // namespace ROCKSDB_NAMESPACE
