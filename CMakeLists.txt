@@ -1207,7 +1207,7 @@ if(WITH_BENCHMARK_TOOLS)
   add_executable(table_reader_bench
     table/table_reader_bench.cc)
   target_link_libraries(table_reader_bench
-    ${ROCKSDB_LIB} testharness)
+    ${ROCKSDB_LIB})
 
   add_executable(filter_bench
     util/filter_bench.cc)
